@@ -3,9 +3,82 @@
 -- SKINS VISUAL ENGINE  (extracted from Skin.lua - skin codes/logic only)
 -- ============================================================================
 local function __SkinsVisualEngine()
-    if type(_G.SKIN_TOGGLES) ~= "table" then _G.SKIN_TOGGLES = { ALL_SKIN = false } end
-    _G.ALL_SKINS_ENABLED = (_G.SKIN_TOGGLES.ALL_SKIN == true)
-    local function _skOn(id) local t=_G.SKIN_TOGGLES; if type(t)~="table" then return false end; if t.ALL_SKIN~=true then return false end; return t[id]~=false end
+    -- ================= SKIN ENGINE DIAGNOSTIC LOGGER =================
+    -- Writes to <SaveGames>/SKIN_DEBUG.log so we can see exactly what happens
+    -- on the device. Never throws: every IO call is wrapped in pcall.
+    local _skLogPath, _skLogTried, _skLogMisses = nil, false, 0
+    local _skLogLines = {}
+    local function _skFindLogPath()
+        if _skLogPath then return _skLogPath end
+        _skLogMisses = _skLogMisses + 1
+        if _skLogTried and (_skLogMisses % 60) ~= 0 then return nil end
+        _skLogTried = true
+        local dirs = {
+            "/storage/emulated/0/Android/data/com.tencent.ig/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/",
+            "/storage/emulated/0/Android/data/com.vng.pubgmobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/",
+            "/storage/emulated/0/Android/data/com.pubg.krmobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/",
+            "/storage/emulated/0/Android/data/com.rekoo.pubgm/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/",
+            "/storage/emulated/0/Android/data/com.pubg.imobile/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/",
+            "/sdcard/Android/data/com.tencent.ig/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/SaveGames/",
+            "ShadowTrackerExtra/Saved/SaveGames/",
+            (os.getenv("HOME") or "") .. "/",
+            "/sdcard/",
+            "./",
+        }
+        for _, d in ipairs(dirs) do
+            local ok, f = pcall(io.open, d .. "SKIN_DEBUG.log", "a")
+            if ok and f then
+                pcall(function() f:close() end)
+                _skLogPath = d .. "SKIN_DEBUG.log"
+                return _skLogPath
+            end
+        end
+        return nil
+    end
+    local function SKIN_LOG(...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
+        local line = "[SKIN] " .. table.concat(parts, " ")
+        pcall(print, line)
+        _skLogLines[#_skLogLines + 1] = line
+        if #_skLogLines > 400 then table.remove(_skLogLines, 1) end
+        local p = _skFindLogPath()
+        if p then
+            pcall(function()
+                local f = io.open(p, "a")
+                if f then f:write(line, "\n"); f:close() end
+            end)
+        end
+    end
+    _G.SKIN_LOG = SKIN_LOG
+    _G.SKIN_LogLines = _skLogLines
+    _G.SKIN_LogPath = function() return _skFindLogPath() end
+    _G.SKIN_DumpLog = function()
+        local p = _skFindLogPath()
+        print("===== SKIN_DEBUG (" .. tostring(p) .. ") =====")
+        for _, l in ipairs(_skLogLines) do print(l) end
+        print("===== END SKIN_DEBUG =====")
+        return p
+    end
+
+    -- Toggle handling: tolerant of true/1/"1"/"true"/"on" coming from the UI.
+    local function _skTruthy(v)
+        return v == true or v == 1 or v == "1" or v == "true" or v == "TRUE"
+            or v == "on" or v == "ON" or v == "On"
+    end
+    _G.SKIN_IsTruthy = _skTruthy
+    if type(_G.SKIN_TOGGLES) ~= "table" then _G.SKIN_TOGGLES = {} end
+    if _G.SKIN_TOGGLES.ALL_SKIN == nil then _G.SKIN_TOGGLES.ALL_SKIN = true end
+    _G.ALL_SKINS_ENABLED = _skTruthy(_G.SKIN_TOGGLES.ALL_SKIN)
+    local function _skOn(id)
+        local t = _G.SKIN_TOGGLES
+        if type(t) ~= "table" then return false end
+        if not _skTruthy(t.ALL_SKIN) then return false end
+        if id == nil or id == "ALL_SKIN" then return true end
+        return t[id] == nil or _skTruthy(t[id])
+    end
+    SKIN_LOG("========== ENGINE START ==========")
+    SKIN_LOG("ALL_SKIN =", tostring(_G.SKIN_TOGGLES.ALL_SKIN), "| log =", tostring(_skFindLogPath()))
     local _outfitSavePathCache = nil
     local function _getOutfitSavePath()
         if _outfitSavePathCache then return _outfitSavePathCache end
@@ -522,7 +595,15 @@ local function __SkinsVisualEngine()
                 _G._AO_MATCH_ID = curMatchID
             end
         end
-        local game_frontend_hud = require("game_frontend_hud")
+        -- FIX: this was a hard require. If the module name differs on the
+        -- user's build the whole engine aborted here and NO skin ever worked.
+        -- It is optional, so load it defensively.
+        local game_frontend_hud
+        pcall(function() game_frontend_hud = require("game_frontend_hud") end)
+        if not game_frontend_hud then
+            pcall(function() game_frontend_hud = require("GameLua.Mod.BaseMod.Client.GameFrontendHUD") end)
+        end
+        SKIN_LOG("[boot] game_frontend_hud =", tostring(game_frontend_hud ~= nil))
 
         local DEBUG = true
         local function isInMatchOrGame()
@@ -627,30 +708,91 @@ local function __SkinsVisualEngine()
             return nonMax
         end
 
+        -- Robust item-table discovery. Different PUBG builds expose the item
+        -- config under different table names and field spellings, so try all
+        -- of them instead of silently ending up with zero items.
+        local function _getItemTable()
+            if not (CDataTable and CDataTable.GetTable) then return nil, nil end
+            local names = { "Item", "ItemTable", "Items", "ItemConfig", "ItemData" }
+            for _, n in ipairs(names) do
+                local t
+                local ok = pcall(function() t = CDataTable.GetTable(n) end)
+                if ok and type(t) == "table" and next(t) ~= nil then
+                    return t, n
+                end
+            end
+            return nil, nil
+        end
+
+        local function _itemID(v, key)
+            if type(v) ~= "table" then return tonumber(key) end
+            return tonumber(v.ID or v.Id or v.id or v.ItemID or v.ItemId or v.itemId
+                            or v.ResID or v.ResId or v.resID or key)
+        end
+
+        local function _itemBPID(v)
+            if type(v) ~= "table" then return 0 end
+            return tonumber(v.BPID or v.bpID or v.BpId or v.BpID or v.BluePrintID or 0) or 0
+        end
+
+        local function _itemMainTab(v)
+            if type(v) ~= "table" then return 0 end
+            return tonumber(v.WardrobeMainTab or v.wardrobeMainTab or v.MainTab or v.mainTab
+                            or v.WardrobePage or v.PageType or 0) or 0
+        end
+
+        local function _itemSubType(v)
+            if type(v) ~= "table" then return 0 end
+            return tonumber(v.ItemSubType or v.itemSubType or v.SubType or v.subType
+                            or v.Subtype or 0) or 0
+        end
+
         local function refreshItems()
             if _itemsLoaded then return #ITEMS end
             if #ITEMS > 0 then return #ITEMS end
-            local ItemTable = CDataTable and CDataTable.GetTable and CDataTable.GetTable("Item")
-            if not ItemTable then return 0 end
+            local ItemTable, tableName = _getItemTable()
+            if not ItemTable then
+                SKIN_LOG("[refreshItems] item table not ready (CDataTable =", tostring(CDataTable ~= nil), ")")
+                return 0
+            end
             local nonMax = buildNonMaxLevelSet()
-            local seen, count, skipped = {}, 0, 0
+            local seen, count, skipped, total = {}, 0, 0, 0
+            local loose = {}   -- fallback candidates if strict filter finds nothing
             for id, v in pairs(ItemTable) do
-                local rid = tonumber(v.ID or v.Id or id)
+                local rid = _itemID(v, id)
                 if rid and rid > 0 and not seen[rid] then
-                    local bpId = tonumber(v.BPID or v.bpID or v.BpId or 0) or 0
-                    local mainTab = tonumber(v.WardrobeMainTab or v.wardrobeMainTab or 0) or 0
-                    if bpId ~= 0 or mainTab ~= 0 then
-                        seen[rid] = true
+                    seen[rid] = true
+                    total = total + 1
+                    local bpId = _itemBPID(v)
+                    local mainTab = _itemMainTab(v)
+                    local st = _itemSubType(v)
+                    local strict = (bpId ~= 0 or mainTab ~= 0)
+                    if strict then
                         if nonMax[rid] then
                             skipped = skipped + 1
                         else
                             ITEMS[#ITEMS + 1] = rid
                             count = count + 1
                         end
+                    elseif st > 0 and rid >= 100000 then
+                        -- Plausible skin/equipment id even without tab metadata.
+                        loose[#loose + 1] = rid
                     end
                 end
             end
+            if count == 0 and #loose > 0 then
+                -- Strict metadata was missing on this build: fall back to all
+                -- entries that look like real item ids with a subtype.
+                table.sort(loose)
+                for _, rid in ipairs(loose) do
+                    ITEMS[#ITEMS + 1] = rid
+                    count = count + 1
+                end
+                SKIN_LOG("[refreshItems] strict filter empty -> loose fallback used")
+            end
             table.sort(ITEMS)
+            SKIN_LOG("[refreshItems] table =", tostring(tableName), "| rows =", total,
+                     "| count =", count, "| skipped =", skipped, "| ITEMS =", #ITEMS)
             if count > 0 then
                 _itemsLoaded = true
                 log("@IG_Serioton", count, "-- by @IG_Serioton", "(-- by @IG_Serioton", skipped, "-- by @IG_Serioton)")
@@ -1149,6 +1291,193 @@ local function __SkinsVisualEngine()
             end
         end
 
+        -- =====================================================================
+        -- AUTO-SELECT ENGINE
+        -- The wardrobe injection makes every skin *browsable*, but in-game only
+        -- the item actually equipped is rendered. If the player never picked a
+        -- skin for a slot, that slot stayed default ("some skins show, some
+        -- don't"). This fills every slot with the best available injected skin
+        -- so outfits, guns, bag/helmet/armor, parachute, glider, throwables,
+        -- vehicles, emotes and hall theme all show at once.
+        -- =====================================================================
+        local _autoSelDone = false
+        local _autoSelReport = {}
+
+        local function _pickBest(list)
+            -- Deterministic: highest resource id per category (usually newest).
+            local best = 0
+            for _, rid in ipairs(list) do if rid > best then best = rid end end
+            return best
+        end
+
+        local function autoSelectAllSkins(force)
+            if _autoSelDone and not force then return _autoSelReport end
+            local nItems = refreshItems()
+            if nItems <= 0 then
+                SKIN_LOG("[autoSelect] skipped: no items yet")
+                return _autoSelReport
+            end
+            local cch = cache()
+            cch.clothes = cch.clothes or {}
+            cch.equip = cch.equip or {}
+            cch.weapons = cch.weapons or {}
+
+            local suits, tops, pants, shoes, underT, underP = {}, {}, {}, {}, {}, {}
+            local accByType = {}   -- one best accessory per sub-type (hat/mask/glasses...)
+            local equip = { bag = {}, helmet = {}, armor = {}, parachute = {}, glider = {} }
+            local weaponRes = {}
+            local throwRes = { [612] = {}, [613] = {}, [614] = {}, [615] = {} }
+            local hallThemes, emotes = {}, {}
+            local vehiclesByType = {}   -- vehicle skins grouped by vehicle sub-type
+
+            for _, rid in ipairs(ITEMS) do
+                local c = cfg(rid)
+                if c then
+                    local st = tonumber(c.ItemSubType or c.itemSubType or 0)
+                    local it = tonumber(c.ItemType or c.itemType or 0)
+                    local slot = getEquipSkinSlot(rid)
+                    local wid = weaponIdFromSkin(rid)
+                    if slot then
+                        equip[slot][#equip[slot] + 1] = rid
+                    elseif wid then
+                        weaponRes[wid] = weaponRes[wid] or {}
+                        weaponRes[wid][#weaponRes[wid] + 1] = rid
+                    elseif _K.THROW_SUB[st] then
+                        throwRes[st][#throwRes[st] + 1] = rid
+                    elseif isHallThemeRes(rid) then
+                        hallThemes[#hallThemes + 1] = rid
+                    elseif it == 22 then
+                        emotes[#emotes + 1] = rid
+                    elseif st == _K.ST_TOP then
+                        if isFullSuitRes(rid) then suits[#suits + 1] = rid
+                        else tops[#tops + 1] = rid end
+                    elseif st == _K.ST_PANTS then pants[#pants + 1] = rid
+                    elseif st == _K.ST_SHOES then shoes[#shoes + 1] = rid
+                    elseif st == _K.ST_UNDER_T then underT[#underT + 1] = rid
+                    elseif st == _K.ST_UNDER_P then underP[#underP + 1] = rid
+                    elseif it == 4 and (st == 400 or st == 408 or st == 409 or st == 410) then
+                        equip.parachute[#equip.parachute + 1] = rid
+                    elseif st >= 400 and st < 500 then
+                        accByType[st] = accByType[st] or {}
+                        accByType[st][#accByType[st] + 1] = rid
+                    elseif wardrobeMainTab(rid) == _K.WARDROBE_PAGE_VEHICLE then
+                        vehiclesByType[st] = vehiclesByType[st] or {}
+                        vehiclesByType[st][#vehiclesByType[st] + 1] = rid
+                    end
+                end
+            end
+
+            local rep = {}
+            -- Outfit: prefer a full suit so the whole body is one premium skin.
+            -- A full suit already covers top+pants, so we must NOT also add
+            -- loose body clothes (they fight the suit and make it flicker).
+            local suitRes = _pickBest(suits)
+            if suitRes > 0 then
+                cch.outfitRes = suitRes
+                cch.outfitIns = R.resToIns[suitRes]
+                for resID in pairs(cch.clothes) do
+                    if isBodyClothSubType(subType(cfg(resID))) then cch.clothes[resID] = nil end
+                end
+                rep.outfit = suitRes
+            else
+                local topRes = _pickBest(tops)
+                if topRes > 0 then cch.clothes[topRes] = true; rep.top = topRes end
+                local pRes = _pickBest(pants)
+                if pRes > 0 then cch.clothes[pRes] = true; rep.pants = pRes end
+                local uT = _pickBest(underT); if uT > 0 then cch.clothes[uT] = true end
+                local uP = _pickBest(underP); if uP > 0 then cch.clothes[uP] = true end
+            end
+            -- Shoes are their own slot: keep them even with a full suit.
+            local sRes = _pickBest(shoes); if sRes > 0 then cch.clothes[sRes] = true; rep.shoes = sRes end
+            -- Accessories: best one per sub-type so hats/masks/glasses don't
+            -- overwrite each other and the wardrobe stays light.
+            local accCount = 0
+            for st, list in pairs(accByType) do
+                local best = _pickBest(list)
+                if best > 0 then cch.clothes[best] = true; accCount = accCount + 1 end
+            end
+            rep.accessories = accCount
+
+            -- Equipment slots (bag / helmet / armor / parachute / glider)
+            for _, slot in ipairs({ "bag", "helmet", "armor", "parachute", "glider" }) do
+                local best = _pickBest(equip[slot])
+                if best > 0 then
+                    cch.equip[slot] = best
+                    cch.equip[slot .. "Ins"] = R.resToIns[best]
+                    rep[slot] = best
+                end
+            end
+
+            -- Weapon skins: one per weapon id
+            local wcount = 0
+            for wid, list in pairs(weaponRes) do
+                local best = _pickBest(list)
+                if best > 0 then
+                    cch.weapons[wid] = { resID = best, insID = R.resToIns[best] }
+                    wcount = wcount + 1
+                end
+            end
+            rep.weapons = wcount
+
+            -- Throwables
+            cch.throwObjects = cch.throwObjects or {}
+            local tcount = 0
+            for st, list in pairs(throwRes) do
+                local best = _pickBest(list)
+                if best > 0 then
+                    cch.throwObjects[st] = { resID = best, insID = R.resToIns[best] or 0 }
+                    tcount = tcount + 1
+                end
+            end
+            rep.throwables = tcount
+
+            -- Hall theme / vehicles / emotes.
+            -- These are applied through the game's own put-on APIs later
+            -- (applyAutoExtras), so here we only remember the choice.
+            local extras = { vehicles = {} }
+            local hall = _pickBest(hallThemes)
+            if hall > 0 then
+                cch.hallTheme, cch.hallThemeIns = hall, R.resToIns[hall]
+                extras.hallRes, extras.hallIns = hall, R.resToIns[hall]
+                rep.hallTheme = hall
+            end
+            local vcount = 0
+            for vt, list in pairs(vehiclesByType) do
+                local best = _pickBest(list)
+                if best > 0 then
+                    extras.vehicles[vt] = R.resToIns[best]
+                    if not cch.vehicle then cch.vehicle, cch.vehicleIns = best, R.resToIns[best] end
+                    vcount = vcount + 1
+                end
+            end
+            rep.vehicles = vcount
+            local emo = _pickBest(emotes)
+            if emo > 0 then
+                cch.emote, cch.emoteIns = emo, R.resToIns[emo]
+                extras.emoteRes, extras.emoteIns = emo, R.resToIns[emo]
+                rep.emote = emo
+            end
+            _G.SKIN_AutoExtras = extras
+
+            syncMatchConfigFromCache()
+            -- From now on the auto-selected loadout owns the cache: the lobby
+            -- sync helpers must not wipe / overwrite it with the player's
+            -- real (mostly default) wear.
+            _G.SKIN_AutoSelectActive = true
+            _autoSelDone = true
+            _autoSelReport = rep
+            SKIN_LOG("[autoSelect] outfit =", tostring(rep.outfit or rep.top), "| pants =", tostring(rep.pants),
+                     "| shoes =", tostring(rep.shoes), "| acc =", tostring(rep.accessories),
+                     "| bag =", tostring(rep.bag), "| helmet =", tostring(rep.helmet),
+                     "| armor =", tostring(rep.armor), "| parachute =", tostring(rep.parachute),
+                     "| glider =", tostring(rep.glider), "| weapons =", tostring(rep.weapons),
+                     "| throwables =", tostring(rep.throwables), "| hall =", tostring(rep.hallTheme),
+                     "| vehicles =", tostring(rep.vehicles), "| emote =", tostring(rep.emote))
+            return rep
+        end
+        _G.SKIN_AutoSelect = function() return autoSelectAllSkins(true) end
+        _G.SKIN_AutoSelectReport = function() return _autoSelReport end
+
         local function restorePersistedVehicles()
             if not _G._addOutfitPersistLoaded then return end
             pcall(function()
@@ -1441,6 +1770,7 @@ local function __SkinsVisualEngine()
 
         local _lastSyncWeaponCache = 0
         local function syncWeaponCacheFromLobby()
+            if _G.SKIN_AutoSelectActive then return end
             local now = 0
             pcall(function() now = os.clock() end)
             if (now - _lastSyncWeaponCache) < 0.3 then return end  -- throttle: max ~3x per second
@@ -1505,6 +1835,7 @@ local function __SkinsVisualEngine()
 
         local _lastSyncClothesCache = 0
         local function syncClothesCacheFromLobby()
+            if _G.SKIN_AutoSelectActive then return end
             local now = 0
             pcall(function() now = os.clock() end)
             if (now - _lastSyncClothesCache) < 0.3 then return end  -- throttle: max ~3x per second
@@ -1594,6 +1925,7 @@ local function __SkinsVisualEngine()
         end
 
         local function syncClothesCacheFromLive()
+            if _G.SKIN_AutoSelectActive then return end
             local cch = cache()
             pcall(function()
                 local AvatarData = require("client.logic.data.AvatarData")
@@ -1653,6 +1985,7 @@ local function __SkinsVisualEngine()
         end
 
         local function syncThrowObjectCacheFromLobby()
+            if _G.SKIN_AutoSelectActive then return end
             local cch = cache()
             pcall(function()
                 local fbd = require("client.slua.logic.wardrobe.fashionbag.fashionbag_data")
@@ -1717,18 +2050,50 @@ local function __SkinsVisualEngine()
 
         local _ticker
         pcall(function() _ticker = require("common.time_ticker") end)
+        if type(_ticker) ~= "table" then pcall(function() _ticker = _G.common and _G.common.time_ticker end) end
+        if type(_ticker) ~= "table" then pcall(function() _ticker = _G.time_ticker or _G.TimeTicker end) end
+
+        -- One reliable scheduling helper used by every loop and delayed call.
+        -- Falls back across all known timer APIs instead of silently dropping.
+        local function scheduleLoop(sec, fn)
+            if _ticker and type(_ticker.AddTimerOnce) == "function" then
+                local ok, acc = pcall(_ticker.AddTimerOnce, sec, fn)
+                if ok and acc ~= false then return true end
+            end
+            if type(_G.SetTimer) == "function" then
+                local ok, acc = pcall(_G.SetTimer, sec, fn)
+                if ok and acc ~= false then return true end
+            end
+            if _ticker and type(_ticker.AddTimer) == "function" then
+                local ok, acc = pcall(_ticker.AddTimer, sec, fn)
+                if ok and acc ~= false then return true end
+            end
+            if type(_G.SetTimerOnce) == "function" then
+                local ok, acc = pcall(_G.SetTimerOnce, sec, fn)
+                if ok and acc ~= false then return true end
+            end
+            SKIN_LOG("[timer] FAILED to schedule after", tostring(sec), "s")
+            return false
+        end
+
         local function later(sec, fn)
-            if _G.SetTimer then pcall(_G.SetTimer, sec, fn) return end
-            if _ticker and _ticker.AddTimer then pcall(_ticker.AddTimer, sec, fn) end
+            return scheduleLoop(sec, fn)
         end
 
         local function getEntity()
             local ok, dc = pcall(require, "client.slua.logic.wardrobe.logic_wardrobe_data_center")
-            if not ok or not dc then return nil end
+            if not ok or not dc then
+                SKIN_LOG("[getEntity] require failed (ok =", tostring(ok), ")")
+                return nil
+            end
             local ok2, e = pcall(dc.GetWardrobeData, EWardrobeDataSource and EWardrobeDataSource.Wardrobe or nil)
             if ok2 and e then return e end
             ok2, e = pcall(dc.GetWardrobeData)
-            return ok2 and e or nil
+            if not (ok2 and e) then
+                SKIN_LOG("[getEntity] GetWardrobeData returned nothing (ok =", tostring(ok2), ")")
+                return nil
+            end
+            return e
         end
 
         local function alreadyHave(entity, resID)
@@ -1796,10 +2161,27 @@ local function __SkinsVisualEngine()
 
         local function injectOne(entity, resID, insID)
             if alreadyHave(entity, resID) then
-                R.resToIns[resID] = R.resToIns[resID] or insID
-                R.insToRes[insID] = resID
+                -- The player already owns this item, so there is no fake
+                -- instance: we MUST map to the real instid, otherwise
+                -- putOnCloth(fakeIns) silently fails and the skin never shows.
+                local realIns = nil
                 pcall(function()
-                    local data = entity.GetDataByInsID and entity:GetDataByInsID(R.resToIns[resID])
+                    local arr = entity.ResIDToIndexArrayMap and entity.ResIDToIndexArrayMap[resID]
+                    if arr then
+                        for _, idx in pairs(arr) do
+                            local d = entity._data and entity._data[idx]
+                            if d and d.count and d.count > 0 and d.instid then
+                                realIns = tonumber(d.instid)
+                                if realIns then break end
+                            end
+                        end
+                    end
+                end)
+                local useIns = realIns or R.resToIns[resID] or insID
+                R.resToIns[resID] = useIns
+                R.insToRes[useIns] = resID
+                pcall(function()
+                    local data = entity.GetDataByInsID and entity:GetDataByInsID(useIns)
                     if data then ensureDepotTabFields(entity, data, resID) end
                 end)
                 return true
@@ -1824,8 +2206,11 @@ local function __SkinsVisualEngine()
             local wid = weaponIdFromSkin(resID)
             if not wid then return end
             local Arm = require("client.logic.armory.logic_armory")
-            Arm.rsp_list = Arm.rsp_list or { skin_list = {}, install_list = {} }
-            Arm.rsp_list.skin_list = Arm.rsp_list.skin_list or {}
+            if type(Arm) ~= "table" then return end
+            if type(Arm.rsp_list) ~= "table" then
+                Arm.rsp_list = { skin_list = {}, install_list = {} }
+            end
+            Arm.rsp_list.skin_list = type(Arm.rsp_list.skin_list) == "table" and Arm.rsp_list.skin_list or {}
             if not Arm.rsp_list.skin_list[wid] then Arm.rsp_list.skin_list[wid] = {} end
             Arm.rsp_list.skin_list[wid][resID] = { is_open = 1 }
             Arm.WardrobeInsList = Arm.WardrobeInsList or {}
@@ -1835,9 +2220,17 @@ local function __SkinsVisualEngine()
 -- @IG_Serioton
         local function injectAll(entity)
             if _S.injectedDone then return true end
-            refreshItems()
+            local nItems = refreshItems()
             entity = entity or getEntity()
-            if not entity or not entity.bInit then return false end
+            if not entity then
+                SKIN_LOG("[injectAll] wardrobe entity not ready yet | items =", nItems)
+                return false
+            end
+            if not entity.bInit then
+                SKIN_LOG("[injectAll] entity.bInit = false (wardrobe still initialising) | items =", nItems)
+                return false
+            end
+            SKIN_LOG("[injectAll] injecting", nItems, "items into wardrobe")
 
             if next(_C.fullSuit) == nil then
                 pcall(function()
@@ -1886,26 +2279,50 @@ local function __SkinsVisualEngine()
             end
 
             local n = 0
+            local failed = 0
             for i, resID in ipairs(ITEMS) do
                 local insID = _K.INS_BASE + i
-                if injectOne(entity, resID, insID) then
+                local okOne, added = pcall(injectOne, entity, resID, insID)
+                if okOne and added then
                     n = n + 1
                     local c = cfg(resID)
                     if _K.GUN_SUB[subType(c)] or subType(c) == _K.MELEE_ID then
-                        injectArmory(resID, insID)
+                        -- A broken armory module must not stop the loop,
+                        -- otherwise every item after the first weapon skin
+                        -- would silently never be injected.
+                        local okArm, armErr = pcall(injectArmory, resID, insID)
+                        if not okArm then
+                            SKIN_LOG("[injectArmory] skipped", tostring(resID), tostring(armErr))
+                        end
+                    end
+                elseif not okOne then
+                    failed = failed + 1
+                    if failed <= 5 then
+                        SKIN_LOG("[injectOne] failed", tostring(resID), tostring(added))
                     end
                 end
+            end
+            if failed > 0 then
+                SKIN_LOG("[injectAll] injectOne failures =", failed)
             end
             if n > 0 then
                 _S.injectedDone = true
                 _G.AddOutfit_R = R
                 log("حقن", n, "items")
             end
+            SKIN_LOG("[injectAll] injected =", n, "of", #ITEMS, "| success =", tostring(n > 0))
             return n > 0
         end
 
         local function injectAllSources()
-            return injectAll(getEntity())
+            -- Never let one bad item abort the engine or the apply loops.
+            local ok, res = pcall(injectAll, getEntity())
+            if not ok then
+                SKIN_LOG("[injectAllSources] ERROR:", tostring(res))
+                print("[AddOutfit] injectAll error:", tostring(res))
+                return false
+            end
+            return res
         end
 
         local function refreshWardrobe()
@@ -2465,6 +2882,47 @@ local function __SkinsVisualEngine()
             end)
         end
 
+        -- Applies the non-clothing auto-selected items through the game's
+        -- own APIs (hall theme, garage vehicle skins, emote/motion slots).
+        local _autoExtrasKey = ""
+        local function applyAutoExtras()
+            local ex = _G.SKIN_AutoExtras
+            if type(ex) ~= "table" then return false end
+            local key = tostring(ex.hallIns or 0) .. "|" .. tostring(ex.emoteIns or 0)
+            for vt, ins in pairs(ex.vehicles or {}) do key = key .. "|" .. tostring(vt) .. ":" .. tostring(ins) end
+            if key == _autoExtrasKey then return false end
+            local did = false
+            if ex.hallIns and isInjectedIns(ex.hallIns) then
+                pcall(putOnHallTheme, ex.hallIns)
+                _G._savedHallThemeIns, _G._savedHallThemeRes = ex.hallIns, ex.hallRes
+                did = true
+            end
+            if ex.vehicles and DataMgr then
+                pcall(function()
+                    DataMgr.VehicleSlotList = DataMgr.VehicleSlotList or {}
+                    for vt, ins in pairs(ex.vehicles) do
+                        if ins then DataMgr.VehicleSlotList[vt] = { ins } end
+                    end
+                end)
+                did = true
+            end
+            if ex.emoteIns and DataMgr then
+                pcall(function()
+                    DataMgr.MotionSlotList = DataMgr.MotionSlotList or {}
+                    DataMgr.MotionSlotList[1] = ex.emoteIns
+                    if EventSystem and EVENTTYPE_MOTION and EVENTID_MOTION_UPDATE_SLOT_LIST then
+                        EventSystem:postEvent(EVENTTYPE_MOTION, EVENTID_MOTION_UPDATE_SLOT_LIST)
+                    end
+                end)
+                _G._savedMotionList = { ex.emoteIns }
+                did = true
+            end
+            _autoExtrasKey = key
+            SKIN_LOG("[autoExtras] hall =", tostring(ex.hallIns), "| vehicles =",
+                     tostring(ex.vehicles and #ex.vehicles or 0), "| emote =", tostring(ex.emoteIns))
+            return did
+        end
+
 -- @IG_Serioton
         local SOCIAL = _G.AddOutfitSocialState or {}
         _G.AddOutfitSocialState = SOCIAL
@@ -2802,12 +3260,16 @@ local function __SkinsVisualEngine()
             restorePersistedThrowObjects()
             restorePersistedHallTheme()
             syncMatchConfigFromCache()
+            pcall(autoSelectAllSkins, false)
+            pcall(applyAutoExtras)
+            syncMatchConfigFromCache()
 
             if not _G._addOutfitPersistLoaded then
                 snapshotLobbyWear()
             end
             local cch = cache()
-            if not _G._addOutfitPersistLoaded and _G._savedOutfitClothes then
+            if not _G._addOutfitPersistLoaded and not _G.SKIN_AutoSelectActive
+                and _G._savedOutfitClothes then
                 for resID in pairs(_G._savedOutfitClothes) do
                     cch.clothes[resID] = true
                 end
@@ -2824,7 +3286,8 @@ local function __SkinsVisualEngine()
                 later(applyStep * 0.12, fn)
             end
 
-            if not _G._addOutfitPersistLoaded and _G._savedRoleWearList and #_G._savedRoleWearList > 0 then
+            if not _G._addOutfitPersistLoaded and not _G.SKIN_AutoSelectActive
+                and _G._savedRoleWearList and #_G._savedRoleWearList > 0 then
                 for _, insID in ipairs(_G._savedRoleWearList) do
                     local id = insID
                     scheduleApply(function() reapplyInjectedIns(id) end)
@@ -3578,7 +4041,7 @@ local function __SkinsVisualEngine()
         end
 
         local function hookMotionEquip()
-            if not _skOn("ALL_SKIN") then return end
+            -- Installed unconditionally; gated at call time by _skOn().
             pcall(function()
                 local wl = require("client.slua.logic.wardrobe.logic_wardrobe_new")
                 if wl._lava_hooked_motion then return end
@@ -3661,7 +4124,6 @@ local function __SkinsVisualEngine()
         end
 
         local function hookIngameEmote()
-            if not _skOn("ALL_SKIN") then return end
             pcall(function()
                 local QEU = require("GameLua.Mod.BaseMod.Client.Emote.QuickExpressionUtils")
                 if QEU._lava_hooked then return end
@@ -6642,7 +7104,6 @@ local function __SkinsVisualEngine()
         end
 
         local function hookEliminationKingEffect()
-            if not _skOn("ALL_SKIN") then return end
             if _G._lava_hooked_elim_king then return end
             _G._lava_hooked_elim_king = true
 
@@ -6765,7 +7226,6 @@ local function __SkinsVisualEngine()
 
         -- ========== Last Strike Champion Final Kill Effect (61950002) ==========
         local function hookFinalKillEffect()
-            if not _skOn("ALL_SKIN") then return end
             if _G._lava_hooked_final_kill then return end
             _G._lava_hooked_final_kill = true
 
@@ -7257,16 +7717,24 @@ local function __SkinsVisualEngine()
             hookFinalKillEffect()
 
             if injectAllSources() then
+                SKIN_LOG("[start] injection OK -> refreshWardrobe + lobby apply")
                 refreshWardrobe()
+                pcall(autoSelectAllSkins, true)
                 later(1.0, reapplyLobbyEquipped)
             else
+                SKIN_LOG("[start] injection not ready -> retry loop (40x)")
                 local tries = 0
                 local function retry()
                     tries = tries + 1
                     if injectAllSources() then
+                        SKIN_LOG("[start] retry #", tries, "injection OK")
                         refreshWardrobe()
+                        pcall(autoSelectAllSkins, true)
                         later(1.0, reapplyLobbyEquipped)
                         return
+                    end
+                    if tries == 1 or tries % 10 == 0 then
+                        SKIN_LOG("[start] retry #", tries, "still waiting for wardrobe")
                     end
                     if tries < 40 then later(1.5, retry) end
                 end
@@ -7305,10 +7773,18 @@ local function __SkinsVisualEngine()
         
         -- Periodic application functions with different rates
         local function fastApplyLoop()
-            if not _skOn("ALL_SKIN") then return end
+            -- Never return before rescheduling: an early return used to kill
+            -- this loop forever if the toggle was off at load time.
+            if _skOn("ALL_SKIN") then
             pcall(function()
                 _timeCount = _timeCount + 1
                 _S.globalFrame = _timeCount
+                if _timeCount == 1 or (_timeCount % 60) == 0 then
+                    SKIN_LOG("[heartbeat] tick =", _timeCount, "| state =",
+                             (isInLobby() and "lobby" or (isInGamePlay() and "gameplay" or "other")),
+                             "| injected =", tostring(_S.injectedDone),
+                             "| matchTimer =", tostring(_S.matchTimer ~= nil))
+                end
                 -- Refresh kill counter UI periodically
                 if _timeCount % 3 == 0 and _killCounterHooked then
                     pcall(function()
@@ -7348,27 +7824,54 @@ local function __SkinsVisualEngine()
                     end
                 end
             end)
-            if _ticker and _ticker.AddTimerOnce then
-                _ticker.AddTimerOnce(1.0, fastApplyLoop)
             end
+            scheduleLoop(1.0, fastApplyLoop)
         end
         
         -- Toggle ON karte hi turant apply (relog ki zarurat nahi)
+        local function ensureSkinHooks()
+            -- Hooks are normally installed by start(); re-run them on demand so
+            -- toggling the switch ON always works, even if modules loaded late.
+            pcall(hookMotionEquip)
+            pcall(hookIngameEmote)
+            pcall(hookEliminationKingEffect)
+            pcall(hookFinalKillEffect)
+        end
+
         _G.SKIN_ApplyNow = function()
-            if not _skOn("ALL_SKIN") then return end
+            if not _skOn("ALL_SKIN") then
+                SKIN_LOG("[ApplyNow] aborted: ALL_SKIN is off")
+                return
+            end
+            SKIN_LOG("[ApplyNow] invoked")
+            ensureSkinHooks()
+            pcall(injectAllSources)
+            pcall(autoSelectAllSkins, true)
             pcall(function()
-                if isInLobby() then pcall(reapplyLobbyEquipped) end
+                if isInLobby() then
+                    _S.lobbyApplied = false
+                    pcall(reapplyLobbyEquipped)
+                end
                 if isInGamePlay() then
                     local ch = getLocalChar()
                     if ch and slua.isValid(ch) then
+                        _S.bootstrapped = false
+                        _S.matchOutfitDone = false
+                        pcall(bootstrapMatch, ch)
                         pcall(matchApplyAll, ch)
                     end
                 end
             end)
+            SKIN_LOG("[ApplyNow] done")
         end
 
         local function mediumLoop()
+            pcall(ensureSkinHooks)
             pcall(function()
+                -- Keep trying to inject until the wardrobe is ready.
+                if not _S.injectedDone then pcall(injectAllSources) end
+                if _S.injectedDone then pcall(autoSelectAllSkins, false) end
+                if _G.SKIN_AutoSelectActive then pcall(applyAutoExtras) end
                 -- Character boot check at medium rate
                 if isInGamePlay() then
                     local char = getLocalChar()
@@ -7382,9 +7885,7 @@ local function __SkinsVisualEngine()
                     pcall(snapshotLobbyWear)
                 end
             end)
-            if _ticker and _ticker.AddTimerOnce then
-                _ticker.AddTimerOnce(2.5, mediumLoop)
-            end
+            scheduleLoop(2.5, mediumLoop)
         end
         
         local function slowLoop()
@@ -7394,17 +7895,15 @@ local function __SkinsVisualEngine()
                 end
                 pcall(_G.AddOutfitTryFlushSave)
             end)
-            if _ticker and _ticker.AddTimerOnce then
-                _ticker.AddTimerOnce(5.0, slowLoop)
-            end
+            scheduleLoop(5.0, slowLoop)
         end
         
-        -- Start all loops
-        if _ticker and _ticker.AddTimerOnce then
-            _ticker.AddTimerOnce(0.5, fastApplyLoop)
-            _ticker.AddTimerOnce(1.0, mediumLoop)
-            _ticker.AddTimerOnce(2.0, slowLoop)
-        end
+        -- Start all loops (always, independent of the toggle state)
+        SKIN_LOG("[loops] starting | ticker =", tostring(_ticker ~= nil),
+                 "| SetTimer =", tostring(type(_G.SetTimer) == "function"))
+        scheduleLoop(0.5, fastApplyLoop)
+        scheduleLoop(1.0, mediumLoop)
+        scheduleLoop(2.0, slowLoop)
 
         -- Game status change detection via polling (cheaper than hooking events)
         local _lastGameStatus = ""
@@ -7415,12 +7914,19 @@ local function __SkinsVisualEngine()
             else currentStatus = "other" end
             
             if currentStatus ~= _lastGameStatus then
+                SKIN_LOG("[status]", (_lastGameStatus == "" and "?" or _lastGameStatus), "->", currentStatus)
                 _lastGameStatus = currentStatus
                 -- Status changed, run post-switch logic
                 stopMatchWatcher()
                 _S.bootstrapNotified = false
+                _S.bootstrapped = false
                 _S.matchOutfitDone = false
+                _S.matchApplied = false
                 _S.lobbyApplied = false
+                _S.avatarItemsRegistered = false
+                _S.weaponApplied = false
+                _S.lastAppliedWeaponID = 0
+                _S.lastAppliedSkinID = 0
                 _G._lava_fke_triggered = nil
                 pcall(function()
                     if isInLobby() then 
@@ -7437,14 +7943,10 @@ local function __SkinsVisualEngine()
                 pcall(_AutoSaveOutfit, true)
             end
             
-            if _ticker and _ticker.AddTimerOnce then
-                _ticker.AddTimerOnce(3.0, statusPollLoop)
-            end
+            scheduleLoop(3.0, statusPollLoop)
         end
         
-        if _ticker and _ticker.AddTimerOnce then
-            _ticker.AddTimerOnce(1.0, statusPollLoop)
-        end
+        scheduleLoop(1.0, statusPollLoop)
 
 
         end -- initHooks
@@ -7486,14 +7988,25 @@ local function __SkinsVisualEngine()
         prewarmModules()
         initHooks()
 
+        SKIN_LOG("[boot] engine ready | ALL_SKIN =", tostring(_G.SKIN_TOGGLES.ALL_SKIN))
         log("AddOutfit Merged loaded")
-        notify("-- @IG_Serioton")
+        -- notify is a local defined inside this block; guard it so a nil
+        -- global can never abort the engine at the very last line.
+        pcall(function()
+            if type(_G.notify) == "function" then _G.notify("-- @IG_Serioton") end
+        end)
     end)
     if not _ao_ok then
         print("[AddOutfit] LOAD ERROR:", tostring(_ao_err))
     end
 end
-pcall(__SkinsVisualEngine)
+local _skins_ok, _skins_err = pcall(__SkinsVisualEngine)
+if not _skins_ok then
+    print("[SkinsVisual] LOAD ERROR:", tostring(_skins_err))
+    if type(_G.SKIN_LOG) == "function" then
+        _G.SKIN_LOG("[fatal] engine aborted:", tostring(_skins_err))
+    end
+end
 
 local function startBaselineHacks()
 local GameplayData=require("GameLua.GameCore.Data.GameplayData")
@@ -9325,12 +9838,19 @@ do
             SetFunc=function(c,v) return featureState().SetWallColor(key,value(c,v)) end})
     end
     -- ===== Skins Visual: All Skin Hacks ON/OFF =====
-    if type(_G.SKIN_TOGGLES) ~= "table" then
-        _G.SKIN_TOGGLES = { ALL_SKIN = false }
+    local function skinTruthy(v)
+        if type(_G.SKIN_IsTruthy) == "function" then return _G.SKIN_IsTruthy(v) end
+        return v == true or v == 1 or v == "1" or v == "true" or v == "TRUE" or v == "on" or v == "ON"
     end
-    _G.ALL_SKINS_ENABLED = (_G.SKIN_TOGGLES.ALL_SKIN == true)
+    if type(_G.SKIN_TOGGLES) ~= "table" then
+        _G.SKIN_TOGGLES = {}
+    end
+    if _G.SKIN_TOGGLES.ALL_SKIN == nil then
+        _G.SKIN_TOGGLES.ALL_SKIN = true
+    end
+    _G.ALL_SKINS_ENABLED = skinTruthy(_G.SKIN_TOGGLES.ALL_SKIN)
     local function skinSyncFlags()
-        local on = _G.SKIN_TOGGLES.ALL_SKIN == true
+        local on = skinTruthy(_G.SKIN_TOGGLES.ALL_SKIN)
         _G.ALL_SKINS_ENABLED = on
     end
     skinSyncFlags()
@@ -9338,17 +9858,22 @@ do
         _G.SKIN_ToggleOn = function(id)
             local t = _G.SKIN_TOGGLES
             if type(t) ~= "table" then return true end
-            if t.ALL_SKIN == false then return false end
-            return t[id] ~= false
+            if not skinTruthy(t.ALL_SKIN) then return false end
+            if id == nil or id == "ALL_SKIN" then return true end
+            return t[id] == nil or skinTruthy(t[id])
         end
     end
     local SkinsVisualStack={
         {Key="LunarAllSkinHacks",UI=AliasMap.Switcher,Text="All Skin Hacks",ExpandIndex=0,
-            GetFunc=function() return _G.SKIN_TOGGLES.ALL_SKIN == true end,
+            GetFunc=function() return skinTruthy(_G.SKIN_TOGGLES.ALL_SKIN) end,
             SetFunc=function(c,v)
-                local on = value(c,v) == true
+                local raw = value(c,v)
+                local on = skinTruthy(raw)
                 _G.SKIN_TOGGLES.ALL_SKIN = on
                 skinSyncFlags()
+                if type(_G.SKIN_LOG) == "function" then
+                    _G.SKIN_LOG("[UI] All Skin Hacks ->", tostring(on), "(raw =", tostring(raw), ")")
+                end
                 if on and type(_G.SKIN_ApplyNow) == "function" then
                     pcall(_G.SKIN_ApplyNow)
                 end
