@@ -3031,141 +3031,44 @@ local function ResolveLootByName(name)
 end
 
 -- Kill-message skin hook: killfeed shows the SELECTED weapon/outfit skin.
--- ROBUST PORT (fix): BGMI exposes KillInfo either as a plain class table
--- (KillInfo.FileItem) or wrapped behind __inner_impl / metatable __index,
--- depending on build.  The previous version patched ONLY KillInfo.FileItem and
--- silently installed nothing when that field did not exist, so the kill feed
--- kept showing stock skins.  We now patch every layer that actually exists.
+-- Minimal port (no kill-counter UI): patches DamageRecordData avatar IDs once.
 local function HookKillMessage()
     if _G._KillMsgHooked then return end
     local hooked = false
-
-    local function resolveKillInfo()
-        local paths = {
-            "GameLua.Mod.BaseMod.Client.KillInfoTips.KillInfo",
-            "GameLua.Mod.BaseMod.Client.KillInfoTips.KillInfoItem",
-        }
-        for _, path in ipairs(paths) do
-            local mod = package.loaded[path]
-            if type(mod) ~= "table" then
-                local ok, m = pcall(require, path)
-                if ok and type(m) == "table" then mod = m end
-            end
-            if type(mod) == "table" then return mod end
-        end
-        return nil
-    end
-
-    -- Every table that may own FileItem: the class, its __inner_impl wrapper,
-    -- and the metatable __index used by the engine's Class() shim.
-    local function owners(KillInfo)
-        local list, seen = {}, {}
-        local function add(t)
-            if type(t) == "table" and not seen[t] then seen[t] = true; list[#list + 1] = t end
-        end
-        add(KillInfo)
-        add(rawget(KillInfo, "__inner_impl"))
-        local mt = getmetatable(KillInfo)
-        if type(mt) == "table" then
-            add(mt)
-            add(rawget(mt, "__index"))
-        end
-        return list
-    end
-
-    local function currentWeaponID()
-        local id = nil
-        pcall(function()
-            local pc = GetActivePlayerController and GetActivePlayerController()
-            local lp = pc and GetLocalPlayer and GetLocalPlayer(pc)
-            if not IsValid(lp) then return end
-            local wm = lp.GetWeaponManager and lp:GetWeaponManager()
-            if not IsValid(wm) then return end
-            local w = wm.GetCurrentWeapon and wm:GetCurrentWeapon()
-            if not IsValid(w) and wm.GetInventoryWeaponByPropSlot then
-                w = wm:GetInventoryWeaponByPropSlot(1)
-            end
-            if IsValid(w) and w.GetWeaponID then id = w:GetWeaponID() end
-        end)
-        return id
-    end
-
-    -- One wrapper shared by every layer: a kill gets patched once, not N times.
-    local function makeWrapper(orig)
-        return function(self, DamageRecordData)
-            if CFG.KillMessageEnabled == true then
+    -- NOTE: original defines KillInfo:FileItem directly on the class table
+    -- (KillInfoTips/KillInfo.lua:439); there is no __inner_impl layer.
+    -- Patching a nil path silently never installed the hook.
+    pcall(function()
+        local KillInfo = package.loaded["GameLua.Mod.BaseMod.Client.KillInfoTips.KillInfo"]
+            or (pcall(require, "GameLua.Mod.BaseMod.Client.KillInfoTips.KillInfo") and require("GameLua.Mod.BaseMod.Client.KillInfoTips.KillInfo"))
+        if KillInfo and type(KillInfo.FileItem) == "function" and not _G._KillInfoHacked then
+            local origFileItem = KillInfo.FileItem
+            KillInfo.FileItem = function(self, DamageRecordData)
+                if CFG.KillMessageEnabled ~= true then
+                    if origFileItem then return origFileItem(self, DamageRecordData) end
+                    return
+                end
                 pcall(function()
-                    -- Accept tables AND userdata: the engine hands over a
-                    -- struct-like object on some builds.
-                    if DamageRecordData == nil then return end
-
-                    -- 1. Weapon skin. Prefer the record's own weapon id, else the
-                    --    local player's held weapon (that field is missing on
-                    --    several builds - this was the second silent failure).
-                    local weaponID = tonumber(DamageRecordData.CauserWeaponID)
-                    if not weaponID then weaponID = currentWeaponID() end
-                    if weaponID and _G.get_skin_id then
-                        local skinID = _G.get_skin_id(weaponID)
-                        if skinID and skinID ~= 0 then
+                    if DamageRecordData and _G.get_skin_id and DamageRecordData.CauserWeaponID then
+                        local skinID = _G.get_skin_id(DamageRecordData.CauserWeaponID)
+                        if skinID and skinID ~= DamageRecordData.CauserWeaponID then
                             DamageRecordData.CauserWeaponAvatarID = skinID
-                            DamageRecordData.CauserWeaponID = weaponID
-                            _G._KillMsgHits = (_G._KillMsgHits or 0) + 1
                         end
                     end
-
-                    -- 2. Outfit skin. Two field names exist across builds.
-                    local suit = (_G.OutfitMap and _G.OutfitMap.Suit) or _G.SuitSkin
-                    if suit and suit ~= 0 then
-                        DamageRecordData.CauserClothAvatarID = suit
-                    end
-
-                    -- 3. Golden kill-feed name (same look as the working build).
-                    DamageRecordData.IsUseColor = true
-                    local LC = rawget(_G, "FLinearColor")
-                    if not LC then pcall(function() LC = import("LinearColor") end) end
-                    if LC then
-                        local ok, col = pcall(LC, 1.0, 0.8, 0.0, 1.0)
-                        if ok and col then DamageRecordData.UseColor = col end
+                    if DamageRecordData and _G.OutfitMap.Suit and _G.OutfitMap.Suit ~= 0 then
+                        DamageRecordData.CauserClothAvatarID = _G.OutfitMap.Suit
                     end
                 end)
+                if origFileItem then return origFileItem(self, DamageRecordData) end
             end
-            if orig then return orig(self, DamageRecordData) end
+            _G._KillInfoHacked = true
+            hooked = true
         end
-    end
-
-    local KillInfo = resolveKillInfo()
-    if KillInfo then
-        for _, owner in ipairs(owners(KillInfo)) do
-            local orig = rawget(owner, "FileItem")
-            if type(orig) == "function" and not rawget(owner, "_SecureXFileItem") then
-                local wrapper = makeWrapper(orig)
-                owner.FileItem = wrapper
-                rawset(owner, "_SecureXFileItem", true)
-                if owner.FileItem == wrapper then hooked = true end
-            end
-        end
-    end
-
-    -- Mark hooked ONLY on success: if KillInfo wasn't loaded yet, retry later.
-    if hooked then
-        _G._KillMsgHooked = true
-        _G._KillMsgLayer = (KillInfo and rawget(KillInfo, "__inner_impl")) and "inner_impl" or "class"
-    end
-    return hooked
+    end)
+    -- Mark hooked ONLY on success: if KillInfo wasn't loaded yet, retry next match
+    if hooked then _G._KillMsgHooked = true end
 end
 _G.HookKillMessage = HookKillMessage
-
--- Diagnostics: confirm the hook really landed, in-game.
-_G.SecureX_KillMessageStatus = function()
-    return {
-        enabled = CFG.KillMessageEnabled == true,
-        hooked  = _G._KillMsgHooked == true,
-        layer   = _G._KillMsgLayer,
-        hits    = _G._KillMsgHits or 0,
-        modSkin = CFG.ModSkin == true,
-        suit    = _G.OutfitMap and _G.OutfitMap.Suit,
-    }
-end
 
 local function ResolveLootMark(item)
     if not IsValid(item) then return nil end
@@ -8199,46 +8102,9 @@ do
     end
 end
 
--- ============================================================================
--- SKIN ASSET DOWNLOAD QUEUE  (reliability fix #1)
--- ============================================================================
--- OLD BEHAVIOUR (bug): when the 3-per-5s budget was spent the id was silently
--- DROPPED, and the cache flag was set even if the puffer require failed.  Net
--- result: an id could be permanently "cached but never downloaded", so the
--- skin refused to appear until the mod was reloaded -- the "kabhi kabar skin
--- work nahi karta" symptom.
--- NEW BEHAVIOUR: never drop.  Anything that cannot be downloaded right now
--- goes into a FIFO queue that the watchdog drains a few at a time, and the
--- cache flag is only set when the download was really handed to the puffer.
-_G._skinDlCount      = _G._skinDlCount or 0
-_G._skinDlWindow     = _G._skinDlWindow or 0
-_G._skinDlPending    = _G._skinDlPending or {}
-_G._skinDlPendingSet = _G._skinDlPendingSet or {}
-
-local function _SkinDlKick(id)
-    local started = false
-    pcall(function()
-        local puffer_manager = require("client.slua.logic.download.puffer.puffer_manager")
-        local puffer_const = require("client.slua.logic.download.puffer_const")
-        if not puffer_manager or not puffer_const then return end
-        local state = puffer_manager.GetState(puffer_const.ENUM_DownloadType.ODPTD, { id })
-        if state ~= puffer_const.ENUM_DownloadState.Done
-            and state ~= puffer_const.ENUM_DownloadState.Downloading then
-            puffer_manager.Download(puffer_const.ENUM_DownloadType.ODPTD, { id })
-        end
-        started = true
-    end)
-    return started
-end
-
-local function _SkinDlQueue(id)
-    if not id or id == 0 then return end
-    if _G.skinIdCache[id] then return end
-    if _G._skinDlPendingSet[id] then return end
-    _G._skinDlPendingSet[id] = true
-    _G._skinDlPending[#_G._skinDlPending + 1] = id
-end
-
+-- Throttled asset downloader: max 3 new downloads per 5s window (burst = lag on 2GB)
+_G._skinDlCount = _G._skinDlCount or 0
+_G._skinDlWindow = _G._skinDlWindow or 0
 local function DownloadSkinItem(id)
     if not id or id == 0 then return end
     if _G.skinIdCache[id] then return end
@@ -8247,43 +8113,22 @@ local function DownloadSkinItem(id)
         _G._skinDlWindow = now
         _G._skinDlCount = 0
     end
-    if (_G._skinDlCount or 0) >= 3 then
-        _SkinDlQueue(id)          -- budget spent -> retry later, never drop
-        return
-    end
-    if _SkinDlKick(id) then
+    if (_G._skinDlCount or 0) >= 3 then return end
+    local ok = pcall(function()
+        local puffer_manager = require("client.slua.logic.download.puffer.puffer_manager")
+        local puffer_const = require("client.slua.logic.download.puffer_const")
+        if not puffer_manager or not puffer_const then return end
+        local state = puffer_manager.GetState(puffer_const.ENUM_DownloadType.ODPTD, { id })
+        if state ~= puffer_const.ENUM_DownloadState.Done and state ~= puffer_const.ENUM_DownloadState.Downloading then
+            puffer_manager.Download(puffer_const.ENUM_DownloadType.ODPTD, { id })
+        end
+    end)
+    if ok then
         _G._skinDlCount = (_G._skinDlCount or 0) + 1
         _G.skinIdCache[id] = true
-    else
-        _SkinDlQueue(id)          -- puffer not ready -> retry later
     end
 end
 _G.download_item = DownloadSkinItem -- manual/test trigger alias
-
--- Called from the watchdog: drains the pending queue, max 3 per 5s window.
-_G.DrainSkinDownloadQueue = function()
-    local q = _G._skinDlPending
-    if not q or #q == 0 then return 0 end
-    local now = GetGameTimeNow()
-    if now - (_G._skinDlWindow or 0) > 5.0 then
-        _G._skinDlWindow = now
-        _G._skinDlCount = 0
-    end
-    local budget = 3 - (_G._skinDlCount or 0)
-    local done = 0
-    while budget > 0 and #q > 0 do
-        local id = table.remove(q, 1)
-        _G._skinDlPendingSet[id] = nil
-        if id and not _G.skinIdCache[id] and _SkinDlKick(id) then
-            _G.skinIdCache[id] = true
-            _G._skinDlCount = (_G._skinDlCount or 0) + 1
-            budget = budget - 1
-            done = done + 1
-        end
-    end
-    return done
-end
-
 _G.get_skin_id = function(weaponID)
     if not weaponID then return nil end
     local targetSkinId = _G.WeaponSkinMap and _G.WeaponSkinMap[weaponID]
@@ -8294,352 +8139,129 @@ _G.get_skin_id = function(weaponID)
     return weaponID
 end
 
--- ============================================================================
--- WEAPON SKIN HELPERS
--- ============================================================================
--- A PUBG Mobile weapon skin is TWO things:
---   1. the MESH   -> synData[7].defineID.TypeSpecificID + SetWeaponAvatarID
---   2. the WEAPON-AVATAR BLUEPRINT -> a per-skin component that owns the
---      inspect / raise / reload visual effect ("gun aage piche karta hai")
---      and the skin-specific attachment meshes.
--- The old code only did (1).  That is why the mesh sometimes showed but the
--- skin effect never did.  (2) requires registering the skin res id on the
--- player controller exactly like the lobby does:
---        pc:AddWeaponAvatarItem(resID)
---        pc:InitWeaponAvatarItems()
---        pc:OnWeaponAvatarUpdate()
---        CommerAvatarDataUtil:InitWeaponSkinList(pc, list)
-local function _SkinItemType(skinID)
-    local t = 0
-    pcall(function()
-        local CT = rawget(_G, "CDataTable")
-        if CT and CT.GetTableData then
-            local ic = CT.GetTableData("Item", skinID)
-            if ic then t = tonumber(ic.ItemType or ic.itemType or 0) or 0 end
-            if t == 0 then
-                local wc = CT.GetTableData("WeaponConfig", skinID)
-                if wc then t = tonumber(wc.ItemType or wc.itemType or 0) or 0 end
+-- Batched avatar equip: collect all slot changes, ONE rebuild at the end
+_G.equip_character_avatar = function(Character)
+    if not IsValid(Character) or not Character.AvatarComponent2 then return end
+    local BackpackUtils = nil
+    pcall(function() BackpackUtils = import("BackpackUtils") end)
+    local comp = Character.AvatarComponent2
+    if not IsValid(comp) then return end
+    local SlotSyncData = comp.NetAvatarData and comp.NetAvatarData.SlotSyncData
+    if not SlotSyncData then return end
+    local num = 0
+    pcall(function() num = SlotSyncData:Num() end)
+    if not num or num <= 0 then return end
+    local function ResolveMapped(mappedSkin, slotData, levelFunc)
+        if not mappedSkin or mappedSkin == 0 then return nil end
+        if type(mappedSkin) == "table" then
+            local level = 1
+            if levelFunc and BackpackUtils then
+                pcall(function() level = levelFunc(slotData.AdditionalItemID) or 1 end)
             end
+            if level < 1 then level = 1 end
+            if level > 3 then level = 3 end
+            return mappedSkin[level] or mappedSkin[1]
         end
-    end)
-    if t > 0 then return t end
-    return nil
-end
-
--- Writes defineID through slua.IndexReference when available (the only
--- reliable way to mutate a reflected struct inside a userdata slot) and falls
--- back to plain field assignment.  Also clears operationType so the engine
--- does not treat the change as an unequip.
-local function _SetDefineID(slotData, newID, itemType)
-    if not slotData or not newID then return false end
-    local ok = pcall(function()
-        local ref = nil
-        if _slua and _slua.IndexReference then
-            ref = _slua.IndexReference(slotData, "defineID")
-        end
-        if ref then
-            ref.TypeSpecificID = newID
-            if itemType and ref.Type ~= nil then ref.Type = itemType end
-        elseif slotData.defineID then
-            slotData.defineID.TypeSpecificID = newID
-            if itemType and slotData.defineID.Type ~= nil then slotData.defineID.Type = itemType end
-        end
-        slotData.operationType = 0
-    end)
-    return ok
-end
-
--- Registers weapon-avatar blueprints on the controller.  This is the step that
--- spawns the per-skin effect component; without it the skin is mesh-only.
-_G.RegisterWeaponAvatarItems = function(pc, ids)
-    if not IsValid(pc) or type(ids) ~= "table" then return false end
-    local BU, AU = nil, nil
-    pcall(function() BU = import("BackpackUtils") end)
-    pcall(function() AU = import("AvatarUtils") end)
-    local added = 0
-    for _, resID in ipairs(ids) do
-        resID = tonumber(resID) or 0
-        if resID > 0 then
-            local doneDirect = false
-            pcall(function()
-                if pc.AddWeaponAvatarItem then
-                    pc:AddWeaponAvatarItem(resID)
-                    doneDirect = true
-                end
-            end)
-            if not doneDirect then
-                pcall(function()
-                    if not (BU and AU and pc.WeaponAvatarItemList) then return end
-                    local skinBPID = BU.GetBPIDByResID and BU.GetBPIDByResID(resID)
-                    if not skinBPID then return end
-                    local arr = (_slua and _slua.Array and _slua.Array(UEnums.EPropertyClass.Int)) or nil
-                    if not arr then return end
-                    local parents = AU.GetWeaponAvatarParentIDList
-                        and AU.GetWeaponAvatarParentIDList(skinBPID, arr, false)
-                    if not parents or not parents.Num then return end
-                    for i = 0, parents:Num() - 1 do
-                        local parentID = (parents.Get and parents:Get(i)) or parents[i + 1]
-                        if parentID then pc.WeaponAvatarItemList:Add(parentID, skinBPID) end
-                    end
-                    doneDirect = true
-                end)
+        return mappedSkin
+    end
+    local hasGlider = false
+    for i = 0, num - 1 do
+        local sd = nil
+        pcall(function() sd = SlotSyncData:Get(i) end)
+        if sd and sd.SlotID == _G.CustSlotType.GlideEquipemtSlot then hasGlider = true break end
+    end
+    if not hasGlider then
+        pcall(function() SlotSyncData:Add({ SlotID = _G.CustSlotType.GlideEquipemtSlot, ItemId = 0 }) end)
+        pcall(function() num = SlotSyncData:Num() end)
+    end
+    local wants = {
+        [_G.CustSlotType.ClothesEquipemtSlot] = _G.OutfitMap.Suit,
+        [_G.CustSlotType.BackpackEquipemtSlot] = _G.OutfitMap.Bag,
+        [_G.CustSlotType.HelmetEquipemtSlot] = _G.OutfitMap.Helmet,
+        [_G.CustSlotType.ParachuteEquipemtSlot] = _G.OutfitMap.Parachute,
+        [_G.CustSlotType.GlideEquipemtSlot] = _G.OutfitMap.Glider,
+    }
+    local changed = false
+    for i = 0, (num or 0) - 1 do
+        local sd = nil
+        pcall(function() sd = SlotSyncData:Get(i) end)
+        if sd and wants[sd.SlotID] ~= nil then
+            local levelFunc = nil
+            if sd.SlotID == _G.CustSlotType.BackpackEquipemtSlot and BackpackUtils then
+                levelFunc = BackpackUtils.GetEquipmentBagLevel
+            elseif sd.SlotID == _G.CustSlotType.HelmetEquipemtSlot and BackpackUtils then
+                levelFunc = BackpackUtils.GetEquipmentHelmetLevel
             end
-            if doneDirect then added = added + 1 end
+            local applyId = ResolveMapped(wants[sd.SlotID], sd, levelFunc)
+            if applyId and applyId ~= 0 and sd.ItemId ~= applyId then
+                DownloadSkinItem(applyId)
+                sd.ItemId = applyId
+                pcall(function() SlotSyncData:Set(i, sd) end)
+                changed = true
+            end
         end
     end
-    if added == 0 then return false end
-    pcall(function() if pc.InitWeaponAvatarItems then pc:InitWeaponAvatarItems() end end)
-    pcall(function() if pc.OnWeaponAvatarUpdate then pc:OnWeaponAvatarUpdate() end end)
-    return true
+    if changed and comp.OnRep_BodySlotStateChanged then
+        pcall(comp.OnRep_BodySlotStateChanged, comp)
+    end
 end
 
-_G.InitWeaponSkinListForPC = function(pc, ids)
-    if not IsValid(pc) or type(ids) ~= "table" or #ids == 0 then return false end
-    local ok = pcall(function()
-        local CU = require("GameLua.Activity.Commercialize.GamePlay.CommerAvatarDataUtil")
-        if CU and CU.InitWeaponSkinList then
-            CU:InitWeaponSkinList(pc, ids, nil, nil)
-        end
-    end)
-    return ok
-end
-
--- ============================================================================
--- WEAPON SKIN APPLY (mesh + attachments + effect), no timers
--- ============================================================================
-local function ApplyWeaponSkinPass(PlayerCharacter)
-    if not IsValid(PlayerCharacter) then return 0 end
-    local modifiedCount = 0
+_G.ApplyWeaponSkins = function(PlayerCharacter)
+    if not IsValid(PlayerCharacter) then return end
     pcall(function()
         local WeaponManager = PlayerCharacter.GetWeaponManager and PlayerCharacter:GetWeaponManager()
         if not IsValid(WeaponManager) then return end
-
-        -- Collect EVERY weapon (bag included), not only prop slots 1..3.
-        -- Bag weapons used to be skipped, so a gun picked up into the bag and
-        -- then equipped showed the stock skin until the next swap.
-        local weapons, seen = {}, {}
-        local function addWeapon(w)
-            if IsValid(w) and not seen[w] then
-                seen[w] = true
-                weapons[#weapons + 1] = w
-            end
-        end
-        pcall(function()
-            if WeaponManager.GetAllInventoryWeaponList then
-                local list = WeaponManager:GetAllInventoryWeaponList(false)
-                if list then
-                    if type(list.Num) == "function" then
-                        for i = 0, list:Num() - 1 do
-                            addWeapon((type(list.Get) == "function" and list:Get(i)) or list[i + 1] or list[i])
-                        end
-                    else
-                        for _, w in pairs(list) do addWeapon(w) end
-                    end
-                end
-            end
-        end)
         for slot = 1, 3 do
-            pcall(function()
-                if WeaponManager.GetInventoryWeaponByPropSlot then
-                    addWeapon(WeaponManager:GetInventoryWeaponByPropSlot(slot))
+            local Weapon = WeaponManager.GetInventoryWeaponByPropSlot and WeaponManager:GetInventoryWeaponByPropSlot(slot)
+            if IsValid(Weapon) and IsValid(Weapon.synData) and Weapon.GetWeaponID then
+                local WeaponID = Weapon:GetWeaponID()
+                local SkinID = _G.get_skin_id(WeaponID) or WeaponID
+                local SkinData = nil
+                pcall(function() SkinData = Weapon.synData:Get(7) end)
+                -- NOTE (matches DOWNLOADS port source): accumulate changes, fire
+                -- mesh refresh ONCE at the end. Refresh calls used to sit inside
+                -- the master-only branch, so attachment-only writes never
+                -- refreshed and never became visible.
+                local weaponModified = false
+                if SkinData and SkinData.defineID and SkinData.defineID.TypeSpecificID ~= SkinID then
+                    DownloadSkinItem(SkinID)
+                    SkinData.defineID.TypeSpecificID = SkinID
+                    pcall(function() Weapon.synData:Set(7, SkinData) end)
+                    if Weapon.SetWeaponAvatarID then pcall(function() Weapon:SetWeaponAvatarID(SkinID) end) end
+                    weaponModified = true
                 end
-            end)
-        end
-
-        local wantedSkins = {}
-        for _, Weapon in ipairs(weapons) do
-            if IsValid(Weapon) and Weapon.GetWeaponID then
-                local WeaponID = 0
-                pcall(function() WeaponID = Weapon:GetWeaponID() end)
-                WeaponID = tonumber(WeaponID) or 0
-                if WeaponID > 0 then
-                    local SkinID = tonumber(_G.get_skin_id(WeaponID)) or WeaponID
-                    local synData = Weapon.synData
-                    if not IsValid(synData) then
-                        -- Weapon is still streaming in.  Leave it to the ~1s
-                        -- self-heal / watchdog instead of writing to nil.
-                    else
-                        local SkinData = nil
-                        pcall(function() SkinData = synData:Get(7) end)
-                        local weaponModified = false
-                        if SkinData and SkinData.defineID then
-                            local curID = tonumber(SkinData.defineID.TypeSpecificID) or 0
-                            if curID ~= SkinID then
-                                DownloadSkinItem(SkinID)
-                                _SetDefineID(SkinData, SkinID, _SkinItemType(SkinID))
-                                pcall(function() synData:Set(7, SkinData) end)
-                                weaponModified = true
-                            end
-                        end
-                        -- Selected-skin attachments (own toggle, dirty-checked)
-                        if CFG.AttachmentSkinsEnabled == true and SkinID >= 10000000
-                            and _G.VIP_Attachments and _G.VIP_Attachments[SkinID] then
-                            for AttachIdx = 0, 5 do
-                                local attachData = nil
-                                pcall(function() attachData = synData:Get(AttachIdx) end)
-                                if attachData then
-                                    local attachmentId = 0
-                                    pcall(function()
-                                        if attachData.defineID then
-                                            attachmentId = tonumber(attachData.defineID.TypeSpecificID) or 0
-                                        end
-                                    end)
-                                    if attachmentId > 0 then
-                                        local mapIndex = _G.BaseAttachToIndex[attachmentId]
-                                            or _G.VipAttachToIndex[attachmentId]
-                                        local targetAttachId = mapIndex and _G.VIP_Attachments[SkinID][mapIndex]
-                                        if targetAttachId and targetAttachId > 0
-                                            and targetAttachId ~= attachmentId then
-                                            _SetDefineID(attachData, targetAttachId, _SkinItemType(targetAttachId))
-                                            pcall(function() synData:Set(AttachIdx, attachData) end)
-                                            DownloadSkinItem(targetAttachId)
-                                            weaponModified = true
-                                        end
+                -- Selected-skin attachments (own toggle; dirty-checked per slot, throttled downloads)
+                if CFG.AttachmentSkinsEnabled == true and SkinID >= 10000000 and _G.VIP_Attachments and _G.VIP_Attachments[SkinID] then
+                    for AttachIdx = 0, 5 do
+                        local attachData = nil
+                        pcall(function() attachData = Weapon.synData:Get(AttachIdx) end)
+                        if attachData then
+                            local attachmentId = nil
+                            pcall(function()
+                                if attachData.defineID then attachmentId = attachData.defineID.TypeSpecificID end
+                            end)
+                            if attachmentId and attachmentId > 0 then
+                                local mapIndex = _G.BaseAttachToIndex[attachmentId] or _G.VipAttachToIndex[attachmentId]
+                                if mapIndex and _G.VIP_Attachments[SkinID][mapIndex] and _G.VIP_Attachments[SkinID][mapIndex] > 0 then
+                                    local targetAttachId = _G.VIP_Attachments[SkinID][mapIndex]
+                                    if targetAttachId ~= attachmentId then
+                                        attachData.defineID.TypeSpecificID = targetAttachId
+                                        pcall(function() Weapon.synData:Set(AttachIdx, attachData) end)
+                                        DownloadSkinItem(targetAttachId)
+                                        weaponModified = true
                                     end
                                 end
                             end
                         end
-                        if SkinID >= 10000000 then
-                            wantedSkins[#wantedSkins + 1] = SkinID
-                        end
-                        if weaponModified then
-                            modifiedCount = modifiedCount + 1
-                            if Weapon.SetWeaponAvatarID then
-                                pcall(function() Weapon:SetWeaponAvatarID(SkinID) end)
-                            end
-                            if Weapon.DelayHandleAvatarMeshChanged then
-                                pcall(function() Weapon:DelayHandleAvatarMeshChanged() end)
-                            end
-                            if Weapon.HandleAvatarMeshChanged then
-                                pcall(function() Weapon:HandleAvatarMeshChanged() end)
-                            end
-                            if Weapon.OnRep_synData then
-                                pcall(function() Weapon:OnRep_synData() end)
-                            end
-                        end
                     end
                 end
-            end
-        end
-
-        -- EFFECT FIX: register the weapon-avatar blueprints so the per-skin
-        -- effect component (inspect / raise / reload animation) is spawned.
-        if #wantedSkins > 0 then
-            local pc = nil
-            pcall(function()
-                if PlayerCharacter.GetPlayerControllerSafety then
-                    pc = PlayerCharacter:GetPlayerControllerSafety()
+                if weaponModified then
+                    if Weapon.DelayHandleAvatarMeshChanged then pcall(function() Weapon:DelayHandleAvatarMeshChanged() end) end
+                    if Weapon.OnRep_synData then pcall(function() Weapon:OnRep_synData() end) end
                 end
-            end)
-            if not IsValid(pc) then
-                pcall(function() pc = PlayerCharacter.Owner or PlayerCharacter.PlayerController end)
-            end
-            if IsValid(pc) then
-                _G.RegisterWeaponAvatarItems(pc, wantedSkins)
-                _G.InitWeaponSkinListForPC(pc, wantedSkins)
             end
         end
     end)
-    return modifiedCount
-end
-_G._ApplyWeaponSkinPass = ApplyWeaponSkinPass
-
--- Public entry: applies now, then re-applies at 0.3 / 0.6 / 1.0s because the
--- engine writes default attachments and resets defineID a few frames after a
--- pickup or swap.  Re-running wins that race -> the "kabhi kabar" fix.
-_G.ApplyWeaponSkins = function(PlayerCharacter)
-    if not IsValid(PlayerCharacter) then return end
-    pcall(ApplyWeaponSkinPass, PlayerCharacter)
-    local now = GetGameTimeNow() or 0
-    if PlayerCharacter.AddGameTimer and (now - (_G._SkinReapplyAt or 0)) > 1.5 then
-        _G._SkinReapplyAt = now
-        for _, delay in ipairs({ 0.3, 0.6, 1.0 }) do
-            pcall(function()
-                PlayerCharacter:AddGameTimer(delay, false, function()
-                    if IsValid(PlayerCharacter) then
-                        pcall(ApplyWeaponSkinPass, PlayerCharacter)
-                    end
-                end)
-            end)
-        end
-    end
-end
-
--- ============================================================================
--- WEAPON AVATAR LOADED HOOK (reliability fix #2)
--- ============================================================================
--- Fires whenever a weapon avatar blueprint finishes loading.  The engine
--- resets defineID right after that load, which is the second reason skins
--- intermittently reverted to stock.  Re-apply once, rate-limited, directly
--- (no timers) to avoid any feedback loop.
-_G.HookWeaponAvatarLoaded = function()
-    if _G._SkinAvatarLoadHooked then return true end
-    pcall(function()
-        local WAC = require("GameLua.Mod.Library.GamePlay.Avatar.Component.WeaponAvatarComponent")
-        if not WAC or WAC._securex_avatar_hooked then return end
-        local orig = WAC.OnWeaponAvatarLoadedLua
-        if type(orig) ~= "function" then return end
-        WAC._securex_avatar_hooked = true
-        WAC.OnWeaponAvatarLoadedLua = function(self, slotID, definedID)
-            local r = orig(self, slotID, definedID)
-            pcall(function()
-                if CFG.ModSkin ~= true then return end
-                local pc = GetActivePlayerController()
-                local char = GetLocalPlayer(pc)
-                if not IsValid(char) then return end
-                local mine = false
-                pcall(function()
-                    if self.GetOwnerPawn then mine = (self:GetOwnerPawn() == char) end
-                    if not mine and self.Owner then mine = (self.Owner == char) end
-                    if not mine and self.IsSelf and self:IsSelf() then mine = true end
-                end)
-                if not mine then return end
-                local now = GetGameTimeNow() or 0
-                if (now - (_G._SkinAvatarApplyAt or 0)) < 0.5 then return end
-                _G._SkinAvatarApplyAt = now
-                ApplyWeaponSkinPass(char)
-            end)
-            return r
-        end
-        _G._SkinAvatarLoadHooked = true
-    end)
-    return _G._SkinAvatarLoadHooked == true
-end
-
--- Diagnostic: call _G.SecureX_SkinStatus() in the console / a test key to see
--- exactly which weapon slots are skinned and whether the effect hook is live.
-_G.SecureX_SkinStatus = function()
-    local out = {
-        modSkin = CFG.ModSkin == true,
-        avatarHook = _G._SkinAvatarLoadHooked == true,
-        pendingDownloads = (_G._skinDlPending and #_G._skinDlPending) or 0,
-        cachedAssets = 0,
-        weapons = {},
-    }
-    for _ in pairs(_G.skinIdCache or {}) do out.cachedAssets = out.cachedAssets + 1 end
-    local pc = GetActivePlayerController()
-    local char = GetLocalPlayer(pc)
-    if IsValid(char) then
-        local wm = char.GetWeaponManager and char:GetWeaponManager()
-        if IsValid(wm) then
-            for slot = 1, 3 do
-                local w = wm.GetInventoryWeaponByPropSlot and wm:GetInventoryWeaponByPropSlot(slot)
-                if IsValid(w) and w.GetWeaponID then
-                    local wid, sid, cur = 0, 0, 0
-                    pcall(function() wid = tonumber(w:GetWeaponID()) or 0 end)
-                    pcall(function() sid = tonumber(_G.get_skin_id(wid)) or 0 end)
-                    pcall(function()
-                        local sd = w.synData and w.synData:Get(7)
-                        if sd and sd.defineID then cur = tonumber(sd.defineID.TypeSpecificID) or 0 end
-                    end)
-                    out.weapons[#out.weapons + 1] = {
-                        slot = slot, weapon = wid, want = sid, have = cur, ok = (cur == sid),
-                    }
-                end
-            end
-        end
-    end
-    return out
 end
 
 _G.ApplyVehicleSkins = function(PlayerCharacter)
@@ -11841,7 +11463,6 @@ local function FullMatchInit(bIsMatchChange)
         if CFG.NoRecoilEnabled and _G.ApplyNoRecoil then pcall(_G.ApplyNoRecoil, true) end
         if CFG.ModSkin then
             pcall(_G.ForceRefreshSkinMaps)
-            if _G.HookWeaponAvatarLoaded then pcall(_G.HookWeaponAvatarLoaded) end
             local _skPc = GetActivePlayerController()
             local _skLp = GetLocalPlayer(_skPc)
             if IsValid(_skLp) then
@@ -11925,19 +11546,6 @@ local function WatchdogTick()
         end
         end)
     end
-    -- Kill-message hook retry: KillInfo often loads lazily after the match
-    -- starts, so a one-shot hook at FullMatchInit can miss it entirely.
-    if CFG.KillMessageEnabled and not _G._KillMsgHooked and _G.HookKillMessage then
-        pcall(_G.HookKillMessage)
-    end
-    -- Skin reliability: drain the pending asset download queue (ids that hit
-    -- the 3-per-5s budget are queued, never dropped) and make sure the
-    -- weapon-avatar-loaded hook is installed (that module loads lazily).
-    if CFG.ModSkin then
-        if _G.DrainSkinDownloadQueue then pcall(_G.DrainSkinDownloadQueue) end
-        if _G.HookWeaponAvatarLoaded then pcall(_G.HookWeaponAvatarLoaded) end
-    end
-
     pcall(_G.InitModMenuTab)
 end
 
@@ -12041,12 +11649,6 @@ function _G.SecureX_BootFeatures()
     pcall(WatchdogTick)
     pcall(ApplyTier0Lite)
     pcall(_G.InitModMenuTab)
-    -- Skin engine boot: resolve the selected ids and install the
-    -- weapon-avatar-loaded hook so effects work from the first match.
-    if CFG.ModSkin then
-        pcall(_G.ForceRefreshSkinMaps)
-        if _G.HookWeaponAvatarLoaded then pcall(_G.HookWeaponAvatarLoaded) end
-    end
     pcall(function() if CFG.TargetFPS then ApplyFPSLimit(CFG.TargetFPS) end end)
     pcall(function() if CFG.FPSStabilizerEnabled ~= false then ApplyFPSStabilizer(CFG.FPSStabilizerEnabled) end end)
     return true
