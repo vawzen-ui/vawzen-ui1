@@ -11668,4 +11668,514 @@ _G.StartPBC = function() pcall(FullMatchInit) pcall(WatchdogTick) end
 _G.RetryStart = function() pcall(FullMatchInit) pcall(WatchdogTick) end
 _G.OnMatchStart = function() pcall(FullMatchInit) end
 
+
+-- ============================================================================
+-- AUTO FEEDBACK SYSTEM (Telegram) - Safe Integration with SecureX
+-- Only 1 SS per Chicken Dinner + Premium Emojis
+-- ShowUI hook is non-destructive so SecureX menu/ESP stay intact
+-- ============================================================================
+do
+	local AutoFeedback = {
+		Config = {
+			ServerURL = "https://snowy-cherry-5c20.mauryauvinayu.workers.dev/",
+			TestMode = false
+		},
+		Hooked = false,
+		IsProcessing = false,
+		LastWinTime = 0
+	}
+
+	local function AF_Log(message)
+		print(string.format("[CHETAN POWER ][%s] %s", os.date("%H:%M:%S"), tostring(message)))
+	end
+
+	local function AF_Notify(message)
+		if _G.SRCHUBNotify then
+			pcall(_G.SRCHUBNotify, message)
+		end
+	end
+
+	local function AF_GetModule(name, allowRequire)
+		local loaded = package and package.loaded and package.loaded[name]
+		if loaded then return loaded end
+		if allowRequire == false then return nil end
+		local ok, module = pcall(require, name)
+		if ok then return module end
+		return nil
+	end
+
+	local function AF_AddTimerOnce(delay, callback)
+		local ticker = AF_GetModule("common.time_ticker")
+		if ticker and type(ticker.AddTimerOnce) == "function" then
+			ticker.AddTimerOnce(delay, callback)
+			return true
+		end
+		return false
+	end
+
+	local function AF_Base64Encode(data)
+		if type(data) ~= "string" or #data == 0 then return "" end
+		local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+		local output = {}
+		local outputIndex = 0
+		local index = 1
+		while index <= #data - 2 do
+			local a, b, c = string.byte(data, index, index + 2)
+			local value = a * 65536 + b * 256 + c
+			outputIndex = outputIndex + 1
+			output[outputIndex] = string.char(
+				string.byte(alphabet, math.floor(value / 262144) + 1),
+				string.byte(alphabet, math.floor(value / 4096) % 64 + 1),
+				string.byte(alphabet, math.floor(value / 64) % 64 + 1),
+				string.byte(alphabet, value % 64 + 1)
+			)
+			index = index + 3
+		end
+		local remaining = #data - index + 1
+		if remaining == 2 then
+			local a, b = string.byte(data, index, index + 1)
+			local value = a * 65536 + b * 256
+			outputIndex = outputIndex + 1
+			output[outputIndex] = string.char(
+				string.byte(alphabet, math.floor(value / 262144) + 1),
+				string.byte(alphabet, math.floor(value / 4096) % 64 + 1),
+				string.byte(alphabet, math.floor(value / 64) % 64 + 1),
+				string.byte("=")
+			)
+		elseif remaining == 1 then
+			local value = string.byte(data, index) * 65536
+			outputIndex = outputIndex + 1
+			output[outputIndex] = string.char(
+				string.byte(alphabet, math.floor(value / 262144) + 1),
+				string.byte(alphabet, math.floor(value / 4096) % 64 + 1),
+				string.byte("="),
+				string.byte("=")
+			)
+		end
+		return table.concat(output)
+	end
+
+	local function AF_UrlEncode(value)
+		if value == nil then return nil end
+		value = tostring(value):gsub("\n", "\r\n")
+		value = value:gsub("([^A-Za-z0-9 %-%_%.%~])", function(character)
+			return string.format("%%%02X", string.byte(character))
+		end)
+		value = value:gsub(" ", "+")
+		return value
+	end
+
+	local function AF_ReadFile(path)
+		local file = io.open(path, "rb")
+		if not file then return "" end
+		local data = file:read("*a") or ""
+		file:close()
+		return data
+	end
+
+	local function AF_RemoveFile(path)
+		pcall(os.remove, path)
+	end
+
+	local function AF_GetRankName(rank)
+		if rank < 1700 then return "Bronze"
+		elseif rank < 2200 then return "Silver"
+		elseif rank < 2700 then return "Gold"
+		elseif rank < 3200 then return "Platinum"
+		elseif rank < 3700 then return "Diamond"
+		elseif rank < 4200 then return "Crown"
+		elseif rank < 4700 then return "Ace"
+		elseif rank < 5200 then return "Ace Master"
+		elseif rank < 5600 then return "Ace Dominator"
+		end
+		return "Conqueror"
+	end
+
+	local FeedbackCaptionTemplate = [=[
+<blockquote><b><tg-emoji emoji-id="5314382594068984646">♦️</tg-emoji>  AUTO FEEDBACK <tg-emoji emoji-id="5314382594068984646">♦️</tg-emoji></b></blockquote>
+------------------------------------
+<blockquote><tg-emoji emoji-id="6186145231558159039">✅</tg-emoji> <b>Player</b> - %s
+<tg-emoji emoji-id="6186145231558159039">✅</tg-emoji> <b>UID</b>    - %s
+<tg-emoji emoji-id="6186145231558159039">✅</tg-emoji> <b>Time</b>   - %s
+<tg-emoji emoji-id="6186145231558159039">✅</tg-emoji> <b>Kills</b>  - %d
+<tg-emoji emoji-id="6186145231558159039">✅</tg-emoji> <b>Rank</b>   - %s</blockquote>
+------------------------------------
+<b>[ ACTIVE - SAFE ]</b>
+
+<tg-emoji emoji-id="6293803075073218879">✨</tg-emoji> <b>Owner</b> - @VawzenVip
+]=]
+
+	function AutoFeedback.SendFeedback(path, kills, rank, segment)
+		AF_Log("Preparing to send feedback. Screenshot: " .. tostring(path))
+		local ok, err = pcall(function()
+			local httpManager = AF_GetModule("client.slua.logic.http.http_manager")
+			if not httpManager or type(httpManager.Post) ~= "function" then
+				AF_Log("HTTP manager is unavailable.")
+				AutoFeedback.IsProcessing = false
+				return
+			end
+			local attempts = 0
+			local function TrySend()
+				local imageData = AF_ReadFile(path)
+				if #imageData > 0 then
+					local uid = "unknown"
+					if _G.DataMgr and _G.DataMgr.roleData and _G.DataMgr.roleData.uid then
+						uid = tostring(_G.DataMgr.roleData.uid)
+					elseif _G._KONG_UK then
+						uid = tostring(_G._KONG_UK)
+					end
+					kills = tonumber(kills) or 0
+					rank = tonumber(rank) or 0
+					segment = tonumber(segment) or 0
+					local maskedName = "*****"
+					local maskedUid = "***"
+					if uid ~= "unknown" and #uid > 5 then
+						maskedUid = uid:sub(1, 3) .. "***" .. uid:sub(-2)
+					end
+					local caption = string.format(
+						FeedbackCaptionTemplate,
+						maskedName,
+						maskedUid,
+						os.date("%H:%M:%S %d/%m/%Y"),
+						kills,
+						AF_GetRankName(rank)
+					)
+					local encodedImage = AF_Base64Encode(imageData)
+					encodedImage = encodedImage:gsub("%+", "%%2B")
+					encodedImage = encodedImage:gsub("/", "%%2F")
+					encodedImage = encodedImage:gsub("=", "%%3D")
+					AF_Notify("[SRC_HUB] Uploading Top 1 screenshot to VIP Server...")
+					local body = "base64_image=" .. encodedImage
+						.. "&caption=" .. AF_UrlEncode(caption)
+						.. "&bot_token=" .. AF_UrlEncode("8871144355:AAFsmGY6IlE98wg1RKF1Ipcqk04h7Blye6c")
+						.. "&chat_id=" .. AF_UrlEncode("1311476064")
+					httpManager:Post(
+						AutoFeedback.Config.ServerURL,
+						{["Content-Type"] = "application/x-www-form-urlencoded"},
+						body,
+						nil,
+						function(success, _, response, errorMessage)
+							if success and response and tostring(response):find('"status":%s*true') then
+								AF_Notify("[SRC_HUB] Successfully sent! (Kills: " .. tostring(kills) .. ")")
+							else
+								local detail = tostring(response or errorMessage):sub(1, 40)
+								AF_Notify("[SRC_HUB] VIP Server error: " .. detail)
+							end
+							AF_RemoveFile(path)
+							AutoFeedback.IsProcessing = false
+						end,
+						60
+					)
+					return
+				end
+				attempts = attempts + 1
+				if attempts < 5 and AF_AddTimerOnce(1.0, TrySend) then
+					return
+				end
+				AF_Notify("[SRC_HUB] Screenshot capture failed!")
+				AF_RemoveFile(path)
+				AutoFeedback.IsProcessing = false
+			end
+			TrySend()
+		end)
+		if not ok then
+			AF_Log("SendFeedback Error: " .. tostring(err))
+			AutoFeedback.IsProcessing = false
+		end
+	end
+
+	local AF_HudNames = {
+		"BattleChat_UIBP","Chat_UIBP","ChatMsg_UIBP","TeamAvatar_UIBP","Team_UIBP",
+		"VoiceChat_UIBP","MiniMap_UIBP","Bag_UIBP","PickUp_UIBP","PickUpList_UIBP",
+		"SystemChat_UIBP","InGameChat_UIBP","InGameChatPanel_UIBP","KillFeed_UIBP",
+		"Elimination_UIBP","ChatHUD_UIBP","ChatPanel_UIBP","MainHUD_UIBP","BattleHUD_UIBP"
+	}
+
+	local function AF_GetRankAndSegment()
+		local rank = 0
+		local segment = 0
+		pcall(function()
+			local battleResult = _G.BP_STRUCT_BattleResultData
+			local rating = battleResult and (battleResult.rating or battleResult.BP_STRUCT_BTRating)
+			if rating then
+				rank = tonumber(rating.rank_rating) or 0
+				segment = tonumber(rating.new_segment) or 0
+			end
+			if rank == 0 then
+				local funcUtil = AF_GetModule("common.func_util")
+				local roleData = _G.DataMgr and _G.DataMgr.roleData
+				if funcUtil and type(funcUtil.GetCurMaxSegementLevel) == "function"
+					and roleData and roleData.allzoneSegment then
+					segment = tonumber(funcUtil.GetCurMaxSegementLevel(roleData.allzoneSegment)) or 0
+				end
+				if roleData and roleData.segment_rating then
+					for _, value in pairs(roleData.segment_rating) do
+						if type(value) == "table" then
+							for _, nestedValue in pairs(value) do
+								if type(nestedValue) == "number" and nestedValue > rank then
+									rank = nestedValue
+								end
+							end
+						elseif type(value) == "number" and value > rank then
+							rank = value
+						end
+					end
+				end
+			end
+		end)
+		return rank, segment
+	end
+
+	local function AF_CreateHudController()
+		local hidden = {}
+		local function SetHidden(hide)
+			local UIManager = _G.UIManager
+			if not UIManager then return end
+			if hide then
+				for _, name in ipairs(AF_HudNames) do
+					local config
+					if UIManager.UI_Config_InGame and UIManager.UI_Config_InGame[name] then
+						config = UIManager.UI_Config_InGame[name]
+					elseif UIManager.UI_Config and UIManager.UI_Config[name] then
+						config = UIManager.UI_Config[name]
+					end
+					if config then
+						local view = type(UIManager.GetUI) == "function" and UIManager.GetUI(config) or nil
+						if view then
+							pcall(function()
+								if type(view.SetVisibility) == "function" then
+									view:SetVisibility(2)
+								elseif view.UIRoot and type(view.UIRoot.SetVisibility) == "function" then
+									view.UIRoot:SetVisibility(2)
+								elseif type(UIManager.HideUI) == "function" then
+									UIManager.HideUI(config)
+								elseif type(UIManager.CloseUI) == "function" then
+									UIManager.CloseUI(config)
+								end
+							end)
+							table.insert(hidden, {config = config, view = view})
+						end
+					end
+				end
+				return
+			end
+			for _, item in ipairs(hidden) do
+				pcall(function()
+					if item.view and type(item.view.SetVisibility) == "function" then
+						item.view:SetVisibility(0)
+					elseif item.view and item.view.UIRoot and type(item.view.UIRoot.SetVisibility) == "function" then
+						item.view.UIRoot:SetVisibility(0)
+					elseif type(UIManager.ShowUI) == "function" then
+						UIManager.ShowUI(item.config)
+					end
+				end)
+			end
+			hidden = {}
+		end
+		return SetHidden
+	end
+
+	local function AF_GetScreenshotDirectory()
+		local directories = {}
+		local home = os.getenv("HOME")
+		if home and home ~= "" then
+			table.insert(directories, home .. "/Documents/ShadowTrackerExtra/Saved/")
+		end
+		local packages = {"com.tencent.ig","com.vng.pubgmobile","com.pubg.krmobile","com.rekoo.pubgm","com.pubg.imobile"}
+		for _, packageName in ipairs(packages) do
+			table.insert(directories,
+				"/storage/emulated/0/Android/data/" .. packageName
+				.. "/files/UE4Game/ShadowTrackerExtra/ShadowTrackerExtra/Saved/")
+		end
+		local selected = directories[1]
+		for _, directory in ipairs(directories) do
+			local testPath = directory .. "t.tmp"
+			local file = io.open(testPath, "w")
+			if file then
+				file:close()
+				os.remove(testPath)
+				selected = directory
+				break
+			end
+		end
+		return selected
+	end
+
+	local function AF_CaptureAndSend(kills, rank, segment, restoreHud)
+		local restored = false
+		local function RestoreHudOnce()
+			if not restored then
+				restored = true
+				restoreHud(false)
+			end
+		end
+		local ScreenshotMaker = import("ScreenshotMaker")
+		if not ScreenshotMaker then
+			RestoreHudOnce()
+			AutoFeedback.IsProcessing = false
+			return
+		end
+		local directory = AF_GetScreenshotDirectory()
+		if not directory then
+			RestoreHudOnce()
+			AutoFeedback.IsProcessing = false
+			return
+		end
+		local path = directory .. string.format("kongwin_%s.jpg", os.time())
+		local uiUtil = AF_GetModule("client.common.ui_util")
+		local gameInstance = uiUtil and uiUtil.GetGameInstance and uiUtil.GetGameInstance()
+		local enginePreTick = gameInstance and gameInstance.EnginePreTick
+		if not enginePreTick or type(enginePreTick.Add) ~= "function" then
+			RestoreHudOnce()
+			AutoFeedback.IsProcessing = false
+			return
+		end
+		local ticker = AF_GetModule("common.time_ticker")
+		if not ticker or type(ticker.AddTimerOnce) ~= "function" then
+			RestoreHudOnce()
+			AutoFeedback.IsProcessing = false
+			return
+		end
+		enginePreTick:Add(function()
+			local actualPath = ScreenshotMaker.MakePictureByName(path, true)
+			if type(enginePreTick.Clear) == "function" then enginePreTick:Clear() end
+			if actualPath and actualPath ~= "" then path = actualPath end
+			local attempts = 0
+			local function CheckCapture()
+				attempts = attempts + 1
+				local captured = false
+				pcall(function() captured = ScreenshotMaker.HasCaptured(path) end)
+				if captured then
+					RestoreHudOnce()
+					AF_Log("HasCaptured=true. Flushing to disk via ResizePicture...")
+					pcall(ScreenshotMaker.ResizePicture, path, 0.9, path)
+					ticker.AddTimerOnce(2.0, function()
+						if #AF_ReadFile(path) > 0 then
+							AutoFeedback.SendFeedback(path, kills, rank, segment)
+						else
+							AF_Notify("[SRC_HUB] iOS image read error!")
+							AutoFeedback.IsProcessing = false
+						end
+					end)
+				elseif attempts < 15 then
+					ticker.AddTimerOnce(1, CheckCapture)
+				else
+					RestoreHudOnce()
+					AF_Notify("[SRC_HUB] Screenshot capture failed!")
+					AutoFeedback.IsProcessing = false
+				end
+			end
+			ticker.AddTimerOnce(1, CheckCapture)
+		end)
+	end
+
+	function AutoFeedback.ProcessWin(kills)
+		if AutoFeedback.IsProcessing then
+			AF_Log("Already processing a win, skipping extra screenshot.")
+			return
+		end
+		local now = os.time()
+		if now - AutoFeedback.LastWinTime < 25 then
+			AF_Log("Debounce: win detected too soon after previous one, skipping.")
+			return
+		end
+		kills = tonumber(kills) or 0
+		local rank, segment = AF_GetRankAndSegment()
+		if kills <= 0 then
+			AF_Log(string.format("Skipping feedback: Kill %d (Requires Kill > 0)", kills))
+			return
+		end
+		AutoFeedback.IsProcessing = true
+		AutoFeedback.LastWinTime = now
+		AF_Notify("[SRC_HUB] Congratulations on getting TOP 1! Rank: " .. AF_GetRankName(rank))
+		local setHudHidden = AF_CreateHudController()
+		setHudHidden(true)
+		local ok, err = pcall(AF_CaptureAndSend, kills, rank, segment, setHudHidden)
+		if not ok then
+			setHudHidden(false)
+			AF_Log("ProcessWin Error: " .. tostring(err))
+			AutoFeedback.IsProcessing = false
+		end
+	end
+
+	local function AF_GetWinnerKills()
+		local kills = 0
+		pcall(function()
+			local likeUtil = AF_GetModule("GameLua.Mod.BaseMod.Client.Like.IngameLikeUtilClient")
+			if likeUtil and type(likeUtil.GetMyPlayerState) == "function" then
+				local playerState = likeUtil.GetMyPlayerState()
+				if playerState and playerState.Kills then
+					kills = tonumber(playerState.Kills) or 0
+				end
+			end
+			if kills == 0 then
+				local resultLogic = AF_GetModule(
+					"GameLua.Mod.BaseMod.Client.BattleResult.BattleResultData.BattleResultDataLogic",
+					false
+				)
+				if resultLogic and type(resultLogic.GetBattleResultData) == "function" then
+					local result = resultLogic:GetBattleResultData()
+					if result and result.BP_mykill then
+						kills = tonumber(result.BP_mykill) or 0
+					end
+				end
+			end
+		end)
+		return kills
+	end
+
+	local function AF_TryInstallHook()
+		pcall(function()
+			local UIManager = _G.UIManager
+			if not UIManager or type(UIManager.ShowUI) ~= "function" then return end
+			if UIManager.__AF_WINHOOK then
+				AF_Log("Win hook already installed.")
+				return
+			end
+
+			AF_Log("Installing safe win-detect hook on UIManager.ShowUI...")
+			local originalShowUI = UIManager.ShowUI
+			UIManager.ShowUI = function(config, params, ...)
+				-- Call original first (never break SecureX / game UI)
+				local ret = originalShowUI(config, params, ...)
+				-- Winner detection is fully isolated
+				pcall(function()
+					if AutoFeedback.IsProcessing then return end
+					if type(params) ~= "table" then return end
+					local isWinner = params.Reason == "win"
+						or params.ShowedWinLogo == true
+						or params.IsWin == true
+						or params.IsWinner == true
+						or params.bWin == true
+						or params.Win == true
+					if not isWinner then return end
+					local kills = AF_GetWinnerKills()
+					if not AF_AddTimerOnce(2.5, function()
+						AutoFeedback.ProcessWin(kills)
+					end) then
+						AutoFeedback.ProcessWin(kills)
+					end
+				end)
+				return ret
+			end
+			UIManager.__AF_WINHOOK = true
+			AutoFeedback.Hooked = true
+			AF_Log("Safe win hook installed.")
+		end)
+	end
+
+	function AutoFeedback.Install()
+		if AutoFeedback.Hooked then return end
+		AF_Log("Scheduling Auto Feedback install...")
+		-- Delay so SecureX menu / catalogs fully init first
+		if not AF_AddTimerOnce(8.0, AF_TryInstallHook) then
+			pcall(AF_TryInstallHook)
+		end
+	end
+
+	_G.GODxRJ_AutoFeedbackRecovered = AutoFeedback
+	-- Soft start: never block SecureX boot
+	pcall(AutoFeedback.Install)
+end
+
 return true
